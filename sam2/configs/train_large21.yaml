@@ -13,8 +13,8 @@ scratch:
 
 dataset:
   # PATHS to Dataset
-  img_folder: /mlcv2/WorkingSpace/Personal/chinhnm/LunchBox/Viettel/Data/train # PATH to MOSE JPEGImages folder
-  gt_folder: /mlcv2/WorkingSpace/Personal/chinhnm/LunchBox/Viettel/Data/train  # PATH to MOSE Annotations folder
+  img_folder: ./train # PATH to MOSE JPEGImages folder
+  gt_folder: ./train  # PATH to MOSE Annotations folder
   #file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 2
 
