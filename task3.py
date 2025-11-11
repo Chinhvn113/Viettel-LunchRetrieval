@@ -80,6 +80,204 @@ POISSON_DEPTH = 9
 # =================================================================================
 # CÁC HÀM PHỤ (giữ nguyên không thay đổi)
 # =================================================================================
+def clean_mask_noise(
+    mask: np.ndarray,
+    keep_seed_xy=None,           # (x,y) of your positive prompt; helps choose the right component
+    min_island_rel=0.01,         # remove positive islands < 1% of main area
+    min_island_abs=200,          # but never keep islands smaller than this many pixels
+    max_hole_rel=0.02,           # fill holes <= 2% of main area
+    max_hole_abs=1500,           # and also fill holes up to this absolute size
+    open_ksize=3,                # morphological opening kernel radius (to kill speckles)
+    close_ksize=5                # morphological closing kernel radius (to seal tiny gaps)
+):
+    """
+    Denoise a binary mask:
+      - keep only the main component (by seed or largest)
+      - remove tiny positive islands
+      - fill interior holes up to a threshold
+      - smooth edges with opening/closing
+    Returns a boolean mask of same shape.
+    """
+    m = (mask.astype(np.uint8) > 0).astype(np.uint8)
+
+    # --- 0) quick despeckle (optional but helps) ---
+    if open_ksize and open_ksize > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_ksize*2+1, open_ksize*2+1))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+
+    # --- 1) keep only the main component (seed-preferred) ---
+    num, lbl, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num <= 1:
+        main = m
+    else:
+        if keep_seed_xy is not None:
+            sx, sy = int(keep_seed_xy[0]), int(keep_seed_xy[1])
+            sy = np.clip(sy, 0, m.shape[0]-1); sx = np.clip(sx, 0, m.shape[1]-1)
+            seed_label = lbl[sy, sx]
+            if seed_label != 0:  # seed is inside some component
+                keep_label = seed_label
+            else:
+                # fall back to largest area (ignore background at 0)
+                keep_label = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+        else:
+            keep_label = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+
+        main = (lbl == keep_label).astype(np.uint8)
+
+    main_area = int(main.sum())
+    if main_area == 0:
+        return mask.astype(bool)  # nothing to do; return original
+
+    # --- 2) remove small positive islands (anything outside main) ---
+    # compute threshold relative to main area
+    island_thresh = max(min_island_abs, int(min_island_rel * main_area))
+
+    # remove any component in m (positive) that is not the main and smaller than threshold
+    # (this also eliminates little “hair” around the target)
+    if num > 1:
+        cleaned = np.zeros_like(m)
+        cleaned[main > 0] = 1  # always keep main
+        for lab in range(1, num):
+            if lab == keep_label: 
+                continue
+            area = int(stats[lab, cv2.CC_STAT_AREA])
+            if area >= island_thresh:
+                cleaned[lbl == lab] = 1
+        m = cleaned
+    else:
+        m = main
+
+    # --- 3) fill interior holes (but only small/medium ones) ---
+    # Find background connected to border by flood-fill to identify *true holes*
+    h, w = m.shape
+    flood = m.copy()
+    ffmask = np.zeros((h+2, w+2), np.uint8)
+    cv2.floodFill(flood, ffmask, (0, 0), 1)      # mark background connected to border as 1
+    bg_border = (flood > 0)                      # background touching border
+    holes = (~bg_border) & (~m.astype(bool))     # interior holes only
+
+    # --- 4) light closing to seal tiny gaps along edges ---
+    if close_ksize and close_ksize > 0:
+        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_ksize*2+1, close_ksize*2+1))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k2, iterations=1)
+
+    return (m > 0)
+
+def _order_box_long_edge_first(box: np.ndarray):
+    # box: 4x2 from cv2.boxPoints, cyclic order. Rotate so edge (p0->p1) is the longest.
+    edges = [np.linalg.norm(box[(i+1) % 4] - box[i]) for i in range(4)]
+    s = int(np.argmax(edges))
+    return np.roll(box, -s, axis=0)
+
+def find_internal_holes(mask: np.ndarray, min_hole_area=80):
+    m = (mask.astype(bool)).astype(np.uint8) * 255
+    cnts, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    holes = np.zeros_like(m, dtype=np.uint8)
+    if hier is None or len(cnts) == 0:
+        return holes.astype(bool), 0, 0.0
+    hole_area = 0.0
+    for i, c in enumerate(cnts):
+        if hier[0][i][3] != -1:   # has parent => hole
+            a = cv2.contourArea(c)
+            if a >= float(min_hole_area):
+                cv2.drawContours(holes, [c], -1, 255, thickness=-1)
+                hole_area += a
+    mask_area = float(np.count_nonzero(mask))
+    return (holes > 0), int(hole_area), (hole_area / max(mask_area, 1.0))
+
+def _longest_hole_free_run(roi: np.ndarray, min_width_px: int, prefer_center=True, hole_min_area=80):
+    # roi is the mask warped so its long side is horizontal (width=W, height=H)
+    holes, _, _ = find_internal_holes(roi, min_hole_area=hole_min_area)
+    col_has_hole = holes.any(axis=0)
+    good = ~col_has_hole
+    best = None
+    i, W = 0, good.size
+    while i < W:
+        if not good[i]:
+            i += 1; continue
+        j = i
+        while j + 1 < W and good[j + 1]:
+            j += 1
+        width = j - i + 1
+        if width >= min_width_px and roi[:, i:j+1].any():
+            area = int(roi[:, i:j+1].sum())
+            if prefer_center:
+                center = W * 0.5
+                slab_center = 0.5 * (i + j)
+                score = area - 0.01 * abs(slab_center - center) * area / W
+            else:
+                score = area
+            if (best is None) or (score > best[0]):
+                best = (score, i, j)
+        i = j + 1
+    return best  # None or (score, s, e)
+
+def slice_cut_holes_along_long_edge(mask: np.ndarray, rect, min_keep_area=300,
+                                    min_slab_width_frac=0.2, step=5, hole_min_area=80):
+    """
+    1) Warp mask so the oriented-box long side is horizontal.
+    2) Pick the longest hole-free slab (continuous columns without holes).
+    3) If none, sweep-cut from the nearer hole-side until holes vanish.
+    4) Warp back; intersect with original mask. Fallback if too small.
+    """
+    Himg, Wimg = mask.shape
+    box = cv2.boxPoints(rect).astype(np.float32)
+    box = _order_box_long_edge_first(box)
+
+    # destination size (long side -> width)
+    w0 = float(rect[1][0]); h0 = float(rect[1][1])
+    W = int(max(1, round(max(w0, h0))))
+    H = int(max(1, round(min(w0, h0))))
+
+    dst = np.array([[0, 0], [W-1, 0], [W-1, H-1], [0, H-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(box, dst)
+    roi = cv2.warpPerspective((mask.astype(np.uint8) * 255), M, (W, H), flags=cv2.INTER_NEAREST) > 0
+
+    # If already hole-free → return original
+    holes0, area0, ratio0 = find_internal_holes(roi, min_hole_area=hole_min_area)
+    if area0 == 0:
+        return mask.astype(bool), {"mode": "no_hole"}
+
+    # Try the longest hole-free run
+    min_width_px = max(1, int(W * float(min_slab_width_frac)))
+    best = _longest_hole_free_run(roi, min_width_px=min_width_px, prefer_center=True, hole_min_area=hole_min_area)
+    if best is not None:
+        _, s, e = best
+        slab = np.zeros_like(roi, dtype=bool)
+        slab[:, s:e+1] = roi[:, s:e+1]
+    else:
+        # Fallback: sweep-cut from the nearer hole side
+        slab = roi.copy()
+        step = max(1, int(step))
+        for _ in range(max(1, W // step)):
+            hmap, areaH, _ = find_internal_holes(slab, min_hole_area=hole_min_area)
+            if areaH == 0:
+                break
+            cols = np.where(hmap.any(axis=0))[0]
+            if cols.size == 0:
+                break
+            left_gap = cols.min()
+            right_gap = (W - 1) - cols.max()
+            if left_gap <= right_gap:
+                slab[:, :min(step, slab.shape[1])] = 0
+            else:
+                slab[:, -min(step, slab.shape[1]):] = 0
+
+    # Keep largest component (avoid tiny scraps)
+    lab_n, lab_i, stats, _ = cv2.connectedComponentsWithStats(slab.astype(np.uint8), connectivity=8)
+    if lab_n > 1:
+        idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        slab = (lab_i == idx)
+
+    # Warp back and intersect with original mask
+    Minv = np.linalg.inv(M)
+    back = cv2.warpPerspective((slab.astype(np.uint8) * 255), Minv, (Wimg, Himg), flags=cv2.INTER_NEAREST) > 0
+    refined = mask.astype(bool) & back
+
+    if refined.sum() < int(min_keep_area):
+        return mask.astype(bool), {"mode": "fallback_small"}
+    return refined.astype(bool), {"mode": "slab", "roi_hole_area": area0, "roi_w": W, "roi_h": H}
+
 def scale_points(points, sx, sy):
     """Scale a list of (x,y) points by (sx, sy) with rounding."""
     if points is None: return None
@@ -767,6 +965,17 @@ def process_image_pair(rgb_path, depth_path, sam_predictor, output_vis_path, out
         # --- Part 2: Segment the object using SAM 2.1 with negatives ---
         segmentation_mask = segment_object_with_sam_old(
             sam_predictor, rgb_image, point_prompt, ROI_W, ROI_H, neg_points=neg_points
+        )
+        # --- NEW: cut along long side, slide to hole-free slab ---
+        segmentation_mask = clean_mask_noise(
+            segmentation_mask,
+            keep_seed_xy=tuple(point_prompt),
+            min_island_rel=0.05,  # remove <1% of main area
+            max_hole_rel=0.02,    # fill holes <=2% of main area
+            min_island_abs=200,
+            max_hole_abs=1500,
+            open_ksize=4,
+            close_ksize=3
         )
         # segmentation_mask_1024 = segment_object_with_sam_old(
         #     sam_predictor,
