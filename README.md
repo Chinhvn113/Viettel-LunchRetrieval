@@ -12,7 +12,7 @@ cd checkpoints && \
 ```
 You can download finetuned checkpoint to checkpoint folder via:
 
-checkpoint[https://drive.google.com/file/d/13Nx5mK8HXu4CKKb6NMacQBMK_urt2oEf/view?usp=sharing]
+(checkpoint)[https://drive.google.com/file/d/13Nx5mK8HXu4CKKb6NMacQBMK_urt2oEf/view?usp=sharing]
 
 ## Run inference
 Replace `RGB_FOLDER`, `DEPTH_FOLDER` with your actual rgb and depth images folder
