@@ -31,7 +31,7 @@ OUTPUT_FOLDER = "Viettel/visualize_output_private" # Thư mục chứa ảnh và
 CSV_OUTPUT_PATH = os.path.join(OUTPUT_FOLDER, "Submission_3D.csv") # Đường dẫn file CSV kết quả
 
 # --- SAM Checkpoint ---
-SAM2_CHECKPOINT = "./checkpoints/checkpoint.pt"
+SAM2_CHECKPOINT = "./sam2_logs/configs/train_large21.yaml/checkpoints/checkpoint.pt"
 MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 SAM_IN_SIZE = 1024
@@ -765,21 +765,21 @@ def process_image_pair(rgb_path, depth_path, sam_predictor, output_vis_path, out
         print(f"Negative prompts (belt): {neg_points}")
 
         # --- Part 2: Segment the object using SAM 2.1 with negatives ---
-        # segmentation_mask = segment_object_with_sam_old(
-        #     sam_predictor, rgb_image, point_prompt, ROI_W, ROI_H, neg_points=neg_points
-        # )
-        segmentation_mask_1024 = segment_object_with_sam_old(
-            sam_predictor,
-            rgb_for_sam,
-            np.array(pt_sam),
-            ROI_W, ROI_H,
-            neg_points=neg_points_sam  # uncomment if using negatives
+        segmentation_mask = segment_object_with_sam_old(
+            sam_predictor, rgb_image, point_prompt, ROI_W, ROI_H, neg_points=neg_points
         )
-        segmentation_mask = cv2.resize(
-            (segmentation_mask_1024.astype(np.uint8) * 255),
-            (W, H),
-            interpolation=cv2.INTER_NEAREST
-        ).astype(bool)              
+        # segmentation_mask_1024 = segment_object_with_sam_old(
+        #     sam_predictor,
+        #     rgb_for_sam,
+        #     np.array(pt_sam),
+        #     ROI_W, ROI_H,
+        #     neg_points=neg_points_sam  # uncomment if using negatives
+        # )
+        # segmentation_mask = cv2.resize(
+        #     (segmentation_mask_1024.astype(np.uint8) * 255),
+        #     (W, H),
+        #     interpolation=cv2.INTER_NEAREST
+        # ).astype(bool)              
         # --- Part 3: Extract the object's point cloud ---
         depth_intrinsics = {'width': W, 'height': H, 'fx': depth_fx, 'fy': depth_fy, 'cx': depth_cx, 'cy': depth_cy}
         object_pcd = extract_point_cloud_from_mask(depth_image, rgb_image, segmentation_mask, depth_intrinsics)
