@@ -11,58 +11,87 @@ import zipfile
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from lean1 import find_surface_normal
-
+import random
 
 # ==================== CONFIGURATION ====================
-
+SEED_SAM = 0
+SEED_RANSAC = 44
+np.random.seed(SEED_SAM)
+random.seed(SEED_SAM)
+torch.manual_seed(SEED_SAM)
+try:
+    o3d.utility.random.seed(SEED_RANSAC)  # Từ Open3D 0.18.0 trở lên
+except AttributeError:
+    print("⚠️ open3d.utility.random.seed() không hỗ trợ trong version hiện tại.")
 # ### THAY ĐỔI ###: Chuyển từ đường dẫn file sang đường dẫn thư mục
 # --- Folder Paths ---
 RGB_FOLDER = "/mlcv2/WorkingSpace/Personal/chinhnm/LunchBox/Viettel/Data/ThiSinh/rgb"
 DEPTH_FOLDER = "/mlcv2/WorkingSpace/Personal/chinhnm/LunchBox/Viettel/Data/ThiSinh/depth"
-OUTPUT_FOLDER = "/mlcv2/WorkingSpace/Personal/chinhnm/LunchBox/Viettel/visualize_output_private" # Thư mục chứa ảnh và file PLY
+OUTPUT_FOLDER = "Viettel/visualize_output_private" # Thư mục chứa ảnh và file PLY
 CSV_OUTPUT_PATH = os.path.join(OUTPUT_FOLDER, "Submission_3D.csv") # Đường dẫn file CSV kết quả
 
 # --- SAM Checkpoint ---
-SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
+SAM2_CHECKPOINT = "./checkpoints/checkpoint.pt"
 MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+SAM_IN_SIZE = 1024
 
 # --- Camera Intrinsics (Depth Camera) ---
 depth_fx = 650.0616455078125
 depth_fy = 650.0616455078125
-depth_cx = 649.5928055078125
+depth_cx = 649.5928955078125
 depth_cy = 360.9415588378906
 
 # Color intrinsics (nếu cần transform sang color frame)
-color_fx = 643.90087890625
-color_fy = 643.1365356445312
-color_cx = 650.2113037109375
-color_cy = 355.79550326171875
-
 R_depth_to_color = np.array([
     [0.9999898076057434, -0.00020347206736914814, -0.004507721401751041],
     [0.00018898719281423837, 0.9999948143959045, -0.0032135415822267532],
     [0.004508351907134056, 0.003212657058611512, 0.9999846816062927]
 ])
+
+# Vector tịnh tiến (Translation Vector t) in meters
 t_depth_to_color = np.array([-0.05905, 8.67399e-5, 0.00041])
+
+# 2. Color Camera Intrinsics
+color_fx = 643.90087890625
+color_fy = 643.1365356445312
+color_cx = 650.2113037109375
+color_cy = 355.79559326171875
+
+# 3. Color Camera Distortion Coefficients
+# Model: Brown-Conrady (k1, k2, p1, p2, k3)
+color_coeffs = np.array([-0.05658450722694397, 0.06544225662946701, 
+                         -0.0008694113348610699, 0.00016751799557823688, 
+                         -0.020957745611667633])
 
 # --- Processing Parameters ---
 ROI_X, ROI_Y, ROI_W, ROI_H = 560, 150, 300, 330
-MAX_MASK_AREA_RATIO = 0.65
-MIN_FILL_RATIO = 0.9
 # ==================== ADVANCED PARAMETERS ====================
 EDGE_MARGIN = 10
 MIN_DEPTH_THRESHOLD = 300
 MAX_DEPTH_THRESHOLD = 5000
 MEDIAN_FILTER_SIZE = 1
 CLUSTER_SIZE = 1
-HIGH_CONFIDENCE_THRESHOLD = 0.97
 NORMAL_VIS_LENGTH = 0.1
-FILL_RATIO_IMPROVEMENT_THRESHOLD = 0.1
 POISSON_DEPTH = 9
+
+
+
 # =================================================================================
 # CÁC HÀM PHỤ (giữ nguyên không thay đổi)
 # =================================================================================
+def scale_points(points, sx, sy):
+    """Scale a list of (x,y) points by (sx, sy) with rounding."""
+    if points is None: return None
+    out = []
+    for x, y in points:
+        out.append((int(round(x * sx)), int(round(y * sy))))
+    return out
+
+def scale_point(p, sx, sy):
+    x, y = p
+    return (int(round(x * sx)), int(round(y * sy)))
+
 def calculate_mask_centroid(mask):
     """
     Calculates the center of mass (centroid) of a binary mask.
@@ -81,7 +110,25 @@ def calculate_mask_centroid(mask):
     cy = int(M["m01"] / M["m00"])
 
     return (cx, cy)
+def centroid_from_mask_in_box(seg_mask: np.ndarray, rect, shrink=0.90, erode_px=2):
+    """
+    Returns (cx, cy) centroid of seg_mask constrained inside the rotated box.
+    Falls back with a looser box if the first one is empty.
+    Also returns the final in-box mask used.
+    """
+    H, W = seg_mask.shape
+    # first, shrink a bit to avoid touching neighbors/edges
+    in_box = mask_from_rotated_rect(rect, (H, W), scale=shrink, erode_px=erode_px)
+    m = seg_mask & in_box
+    if m.sum() == 0:
+        # relax constraints if too small/empty
+        in_box = mask_from_rotated_rect(rect, (H, W), scale=0.98, erode_px=0)
+        m = seg_mask & in_box
+        if m.sum() == 0:
+            return None, in_box  # still empty
 
+    c = calculate_mask_centroid(m)
+    return c, m
 def check_mask_similarity(mask1, mask2, overlap_thresh=0.9, area_sim_thresh=0.9):
     """
     Checks if two masks are similar based on overlap and area similarity.
@@ -132,33 +179,162 @@ def calculate_fill_ratio(mask):
         return 0.0
 
     return mask_area / bbox_area
-def find_closest_point_in_roi(depth_image, roi_x, roi_y, roi_w, roi_h,
+def core_top_mask_from_seg(depth_mm, seg_mask, rect,
+                           shrink=0.90, erode_px=2,
+                           min_depth=300, delta_mm=25):
+    H, W = depth_mm.shape
+    # 1) shrinked rotated box to avoid touching neighbors
+    in_box = mask_from_rotated_rect(rect, (H, W), scale=shrink, erode_px=erode_px)
+    cand = seg_mask & in_box
+
+    if cand.sum() == 0:
+        # relax if empty
+        in_box = mask_from_rotated_rect(rect, (H, W), scale=0.96, erode_px=0)
+        cand = seg_mask & in_box
+
+    if cand.sum() == 0:
+        return cand  # empty, caller should handle
+
+    # 2) robust depth gate around the *mask* depth, not a single pixel
+    vals = depth_mm[cand]
+    vals = vals[vals > min_depth]
+    if len(vals) == 0:
+        return np.zeros_like(seg_mask, dtype=bool)
+
+    # Use median (or np.quantile / mode estimate) as the object top depth
+    z0 = float(np.median(vals))
+    gate = (depth_mm >= (z0 - delta_mm)) & (depth_mm <= (z0 + delta_mm))
+
+    core = cand & gate
+
+    # 3) light erosion to remove thin rims/edges
+    if erode_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px*2+1, erode_px*2+1))
+        core = cv2.erode((core.astype(np.uint8)*255), k, iterations=1) > 0
+
+    return core
+
+def find_closest_point_in_roi(
+    depth_image, roi_x, roi_y, roi_w, roi_h,
+    edge_margin=EDGE_MARGIN,
+    min_depth=MIN_DEPTH_THRESHOLD,
+    max_depth=MAX_DEPTH_THRESHOLD,
+    median_kernel=MEDIAN_FILTER_SIZE,
+    cluster_size=CLUSTER_SIZE,
+    tie_mm=5,
+    verbose=True
+):
+    # 1) Crop ROI
+    roi_depth = depth_image[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w].copy()
+
+    if median_kernel > 1:
+        roi_depth_filtered = cv2.medianBlur(roi_depth, median_kernel)
+    else:
+        roi_depth_filtered = roi_depth.copy()
+
+    # 2) Valid mask + trim edges
+    valid_mask = (roi_depth_filtered > min_depth) & (roi_depth_filtered < max_depth)
+    if edge_margin > 0:
+        edge = np.ones_like(valid_mask, dtype=bool)
+        edge[:edge_margin, :] = False
+        edge[-edge_margin:, :] = False
+        edge[:, :edge_margin] = False
+        edge[:, -edge_margin:] = False
+        valid_mask &= edge
+
+    if not np.any(valid_mask):
+        raise ValueError("No valid depth values in ROI after filtering!")
+
+    if cluster_size > 1:
+        # 3A) Local mean depth (cluster window)
+        roi_f = roi_depth_filtered.astype(float)
+        roi_f[~valid_mask] = np.nan
+
+        # uniform_filter doesn't handle NaN; build masked average
+        # sum and count with constant padding = 0
+        k = cluster_size
+        sum_img = ndimage.uniform_filter(np.nan_to_num(roi_f, nan=0.0), size=k, mode='constant', cval=0.0) * (k*k)
+        cnt_img = ndimage.uniform_filter(valid_mask.astype(np.float32), size=k, mode='constant', cval=0.0) * (k*k)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            local_mean = sum_img / np.maximum(cnt_img, 1e-9)
+            local_mean[ cnt_img < 1 ] = np.inf  # invalid windows
+
+        # min local mean among valid windows
+        valid_local = (cnt_img >= 1) & valid_mask
+        min_local = np.min(local_mean[valid_local])
+
+        # 4A) Tie set = within <= tie_mm of min local mean
+        candidates = valid_local & (local_mean <= (min_local + tie_mm))
+
+        if not np.any(candidates):
+            # fallback to strict min
+            min_idx = np.argmin(np.where(valid_local, local_mean, np.inf))
+            ly, lx = np.unravel_index(min_idx, roi_depth.shape)
+        else:
+            # prefer top: smallest y, then smallest x
+            ys, xs = np.where(candidates)
+            order = np.lexsort((xs, ys))  # primary: ys, secondary: xs
+            ly, lx = ys[order[0]], xs[order[0]]
+    else:
+        # 3B) Single-pixel min
+        roi_masked = roi_depth_filtered.copy().astype(float)
+        roi_masked[~valid_mask] = np.inf
+        min_val = np.min(roi_masked)
+
+        # 4B) Tie set = within <= tie_mm of global minimum
+        candidates = valid_mask & (roi_depth_filtered <= (min_val + tie_mm))
+        if not np.any(candidates):
+            min_idx = np.argmin(roi_masked)
+            ly, lx = np.unravel_index(min_idx, roi_depth.shape)
+        else:
+            ys, xs = np.where(candidates)
+            order = np.lexsort((xs, ys))  # top-most, then left-most
+            ly, lx = ys[order[0]], xs[order[0]]
+
+    # 5) Back to full-image coords
+    pixel_x = roi_x + lx
+    pixel_y = roi_y + ly
+    depth_value = float(depth_image[pixel_y, pixel_x])
+
+    if verbose:
+        print(f"\n=== RESULT ===")
+        print(f"Closest (with tie <= {tie_mm}mm, pref top): ({pixel_x}, {pixel_y}), depth={depth_value:.1f} mm")
+
+    # 6) Unproject to 3D (depth intrinsics)
+    Z = depth_value / 1000.0
+    X = (pixel_x - depth_cx) * Z / depth_fx
+    Y = (pixel_y - depth_cy) * Z / depth_fy
+    point_3d = (X, Y, Z)
+
+    if verbose:
+        print(f"3D coordinates: X={X:.4f}m, Y={Y:.4f}m, Z={Z:.4f}m")
+
+    return pixel_x, pixel_y, depth_value, point_3d
+
+
+def find_farthest_point_in_roi(depth_image, roi_x, roi_y, roi_w, roi_h,
                                edge_margin=EDGE_MARGIN,
                                min_depth=MIN_DEPTH_THRESHOLD,
                                max_depth=MAX_DEPTH_THRESHOLD,
-                               median_kernel=MEDIAN_FILTER_SIZE,
-                               cluster_size=CLUSTER_SIZE,
-                               verbose=True):
-    # ... (Nội dung hàm này giữ nguyên)
-    # 1. Crop ROI từ depth image
+                               median_kernel=MEDIAN_FILTER_SIZE):
+    """
+    Finds the point with the maximum depth value within the ROI, intended to be a
+    background point for a negative SAM prompt.
+    Returns (pixel_x, pixel_y) or raises ValueError if no valid point is found.
+    """
+    # 1. Crop ROI from depth image
     roi_depth = depth_image[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w].copy()
-    
-    if verbose:
-        print(f"\n=== PROCESSING ROI ({roi_x}, {roi_y}, {roi_w}, {roi_h}) ===")
-        print(f"Original ROI shape: {roi_depth.shape}")
-    
-    # 2. Apply median filter để giảm noise
+
+    # 2. Apply median filter to reduce noise
     if median_kernel > 1:
         roi_depth_filtered = cv2.medianBlur(roi_depth, median_kernel)
-        if verbose:
-            print(f"Applied median filter (kernel={median_kernel}x{median_kernel})")
     else:
         roi_depth_filtered = roi_depth.copy()
-    
-    # 3. Tạo valid mask
+
+    # 3. Create a valid mask within the depth range
     valid_mask = (roi_depth_filtered > min_depth) & (roi_depth_filtered < max_depth)
-    
-    # 4. Loại bỏ edge pixels
+
+    # 4. Exclude edge pixels from consideration
     if edge_margin > 0:
         edge_mask = np.ones_like(valid_mask, dtype=bool)
         edge_mask[:edge_margin, :] = False
@@ -166,71 +342,175 @@ def find_closest_point_in_roi(depth_image, roi_x, roi_y, roi_w, roi_h,
         edge_mask[:, :edge_margin] = False
         edge_mask[:, -edge_margin:] = False
         valid_mask = valid_mask & edge_mask
-        
-        if verbose:
-            print(f"Removed {edge_margin}px edges")
-    
+
     if not np.any(valid_mask):
-        raise ValueError("No valid depth values in ROI after filtering!")
-    
-    valid_count = np.sum(valid_mask)
-    if verbose:
-        print(f"Valid pixels: {valid_count}/{roi_depth.size} ({100*valid_count/roi_depth.size:.1f}%)")
-    
-    # 5. Tìm điểm/vùng có depth nhỏ nhất
-    if cluster_size > 1:
-        # Tìm vùng cluster_size x cluster_size có depth trung bình nhỏ nhất
-        roi_depth_masked = roi_depth_filtered.copy().astype(float)
-        roi_depth_masked[~valid_mask] = np.nan
-        
-        # Compute local mean using uniform filter
-        kernel = np.ones((cluster_size, cluster_size)) / (cluster_size * cluster_size)
-        local_mean = ndimage.uniform_filter(roi_depth_masked, size=cluster_size, mode='constant', cval=np.nan)
-        
-        # Find minimum of local means
-        valid_local_mean = np.where(valid_mask, local_mean, np.inf)
-        min_idx = np.argmin(valid_local_mean)
-        local_y, local_x = np.unravel_index(min_idx, roi_depth.shape)
-        
-        if verbose:
-            print(f"Using cluster averaging (size={cluster_size}x{cluster_size})")
-            print(f"Local mean depth at closest point: {local_mean[local_y, local_x]:.1f}mm")
-    else:
-        # Tìm pixel đơn lẻ có depth nhỏ nhất
-        roi_depth_masked = roi_depth_filtered.copy()
-        roi_depth_masked[~valid_mask] = max_depth + 1
-        
-        min_idx = np.argmin(roi_depth_masked)
-        local_y, local_x = np.unravel_index(min_idx, roi_depth.shape)
-    
-    # 6. Chuyển về tọa độ trong ảnh gốc
+        raise ValueError("No valid background depth values in ROI to select a negative prompt!")
+
+    # 5. Find the pixel with the LARGEST depth value
+    # Temporarily set invalid pixels to 0 so they are ignored by argmax
+    roi_depth_masked = roi_depth_filtered.copy()
+    roi_depth_masked[~valid_mask] = 0
+
+    # Find the index of the maximum depth value
+    max_idx = np.argmax(roi_depth_masked)
+    local_y, local_x = np.unravel_index(max_idx, roi_depth.shape)
+
+    # 6. Convert local ROI coordinates to global image coordinates
     pixel_x = roi_x + local_x
     pixel_y = roi_y + local_y
-    depth_value = depth_image[pixel_y, pixel_x]
+
+    print(f"Found farthest point (negative prompt) at: ({pixel_x}, {pixel_y})")
     
-    # Check if found point is at edge (shouldn't happen after filtering)
-    is_at_edge = (local_x < edge_margin or local_x >= roi_w - edge_margin or
-                  local_y < edge_margin or local_y >= roi_h - edge_margin)
-    
-    if verbose:
-        print(f"\n=== RESULT ===")
-        print(f"Closest point pixel: ({pixel_x}, {pixel_y})")
-        print(f"Position in ROI: ({local_x}, {local_y})")
-        print(f"Depth value: {depth_value} mm")
-        if is_at_edge:
-            print("⚠️  WARNING: Point is at ROI edge!")
-    
-    # 7. Unproject sang 3D (sử dụng depth intrinsics)
-    Z = depth_value / 1000.0  # Convert mm to meters
-    X = (pixel_x - depth_cx) * Z / depth_fx
-    Y = (pixel_y - depth_cy) * Z / depth_fy
-    
-    point_3d = (X, Y, Z)
-    
-    if verbose:
-        print(f"3D coordinates: X={X:.4f}m, Y={Y:.4f}m, Z={Z:.4f}m")
-    
-    return pixel_x, pixel_y, depth_value, point_3d
+    return pixel_x, pixel_y
+def mask_from_rotated_rect(rect, shape_hw, scale=0.90, erode_px=0):
+    """
+    Build a boolean mask of a rotated rectangle (optionally shrunk).
+    rect: cv2.minAreaRect output -> ((cx,cy), (w,h), angle)
+    shape_hw: (H, W) of the target image
+    scale: <1 shrinks the box inward; >1 expands
+    erode_px: extra erosion in pixels to stay well inside the box
+    """
+    H, W = shape_hw
+    (cx, cy), (w, h), ang = rect
+    w2, h2 = max(w * scale, 1.0), max(h * scale, 1.0)
+    rect_scaled = ((cx, cy), (w2, h2), ang)
+    box = cv2.boxPoints(rect_scaled)
+    box = np.int32(np.round(box))
+
+    m = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillConvexPoly(m, box, 255)
+
+    if erode_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px*2+1, erode_px*2+1))
+        m = cv2.erode(m, k, iterations=1)
+
+    return m.astype(bool)
+# === NEW: sample K negative points from the conveyor belt (depth background) ===
+def sample_belt_negatives(depth_image, roi_x, roi_y, roi_w, roi_h, k=2,
+                          edge_margin=EDGE_MARGIN,
+                          min_depth=MIN_DEPTH_THRESHOLD,
+                          max_depth=MAX_DEPTH_THRESHOLD,
+                          quantile=0.90,      # take top 10% farthest depth as belt
+                          min_pair_dist=25):  # px, keep the two points apart
+    roi = depth_image[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w].copy()
+    valid = (roi > min_depth) & (roi < max_depth)
+
+    # exclude margins to avoid rails/walls
+    if edge_margin > 0:
+        inner = np.zeros_like(valid, dtype=bool)
+        inner[edge_margin:-edge_margin, edge_margin:-edge_margin] = True
+        valid &= inner
+
+    if not np.any(valid):
+        # fallback: center-left/right inside ROI
+        return [(roi_x + roi_w//4, roi_y + roi_h//2),
+                (roi_x + 3*roi_w//4, roi_y + roi_h//2)]
+
+    # depth threshold for "belt" (farthest region)
+    dvals = roi[valid]
+    thr = np.quantile(dvals, quantile)
+    cand_mask = valid & (roi >= thr)
+    ys, xs = np.where(cand_mask)
+    if len(xs) == 0:
+        # fallback to absolute farthest pixels
+        max_idx = np.argmax(roi * valid)
+        y0, x0 = np.unravel_index(max_idx, roi.shape)
+        # zero out a disk around the first to get a second
+        m = valid.copy().astype(np.uint8)*255
+        cv2.circle(m, (x0, y0), 25, 0, -1)
+        roi2 = roi.copy(); roi2[m == 0] = 0
+        if np.count_nonzero(roi2) == 0:
+            return [(roi_x + x0, roi_y + y0),
+                    (roi_x + min(x0+40, roi_w-1), roi_y + y0)]
+        max2 = np.argmax(roi2)
+        y1, x1 = np.unravel_index(max2, roi2.shape)
+        return [(roi_x + x0, roi_y + y0), (roi_x + x1, roi_y + y1)]
+
+    # random sample while enforcing pair distance
+    idx = np.random.permutation(len(xs))
+    picked = []
+    for i in idx:
+        gx, gy = roi_x + xs[i], roi_y + ys[i]
+        ok = True
+        for (px, py) in picked:
+            if (gx-px)**2 + (gy-py)**2 < min_pair_dist**2:
+                ok = False; break
+        if ok:
+            picked.append((gx, gy))
+            if len(picked) >= k:
+                break
+
+    # ensure we always return k points (fallback to corners)
+    while len(picked) < k:
+        fallback = (roi_x + np.random.randint(edge_margin, roi_w-edge_margin),
+                    roi_y + np.random.randint(edge_margin, roi_h-edge_margin))
+        picked.append(fallback)
+
+    return picked
+def sample_adjacent_object_negatives(depth_mm, seed_xy, r_pixels=80, k=2):
+    """Pick negatives from the largest blob *outside* a disk around the seed."""
+    y, x = int(seed_xy[1]), int(seed_xy[0])
+    h, w = depth_mm.shape
+    # candidate = valid depth
+    valid = (depth_mm > MIN_DEPTH_THRESHOLD).astype(np.uint8)
+    # mask out a disk around seed so we avoid the target object region
+    disk = np.zeros_like(valid); cv2.circle(disk, (x,y), r_pixels, 1, -1)
+    cand = valid & (1 - disk)
+
+    num, labels = cv2.connectedComponents(cand, connectivity=8)[0:2]
+    if num <= 1:  # no components
+        return []
+
+    # find largest component
+    areas = [(labels==i).sum() for i in range(1, num)]
+    i_max = np.argmax(areas) + 1
+    ys, xs = np.where(labels == i_max)
+    if len(xs) == 0: return []
+
+    idx = np.random.choice(len(xs), size=min(k, len(xs)), replace=False)
+    return [(int(xs[i]), int(ys[i])) for i in idx]
+
+def keep_seed_component(mask: np.ndarray, seed_xy, open_ksize=3):
+    """
+    Keep only the connected component (8-conn) that contains the seed (x,y).
+    Optionally break thin bridges with a small opening first.
+    """
+    m = (mask.astype(np.uint8) * 255)
+    if open_ksize and open_ksize > 0:
+        k = np.ones((open_ksize, open_ksize), np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+
+    h, w = m.shape
+    x, y = int(seed_xy[0]), int(seed_xy[1])
+    x = np.clip(x, 0, w - 1); y = np.clip(y, 0, h - 1)
+
+    # if seed is not inside mask, expand slightly and try again
+    if m[y, x] == 0:
+        k = np.ones((3, 3), np.uint8)
+        m = cv2.dilate(m, k, iterations=1)
+        if m[y, x] == 0:
+            # nothing we can do; return original mask
+            return mask.astype(bool)
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8), connectivity=8)
+    lbl = labels[y, x]
+    return (labels == lbl)
+def depth_gate_around_seed(depth_mm, seed_xy, delta_mm=35, min_depth=300):
+    x, y = int(seed_xy[0]), int(seed_xy[1])
+    h, w = depth_mm.shape
+    x = np.clip(x, 0, w-1); y = np.clip(y, 0, h-1)
+    z0 = int(depth_mm[y, x])
+
+    # If center depth is invalid, use local median
+    if z0 < min_depth:
+        r = 5
+        patch = depth_mm[max(0,y-r):y+r+1, max(0,x-r):x+r+1]
+        vals = patch[patch > min_depth]
+        if vals.size == 0:
+            return np.zeros_like(depth_mm, dtype=bool)
+        z0 = int(np.median(vals))
+
+    return (depth_mm >= (z0 - delta_mm)) & (depth_mm <= (z0 + delta_mm))
 def find_normal_from_obb(pcd):
     """
     Calculates the surface normal by finding the top face of the object's
@@ -269,202 +549,28 @@ def find_normal_from_obb(pcd):
         print(f"Error calculating normal from OBB: {e}")
         return None
 
-# ### THAY ĐỔI ###: Thêm hàm helper để tính IoU
-def calculate_containment(mask1, mask2):
+
+def segment_object_with_sam_old(predictor, rgb_image, point_prompt, roi_w, roi_h, neg_points=None):
     """
-    Calculates how much of the smaller mask is contained within the larger one.
-    Returns: Intersection / Area(smaller_mask)
+    Segments an object with SAM. Supports optional negative prompts from the belt.
     """
-    m1 = mask1.astype(bool)
-    m2 = mask2.astype(bool)
-    
-    intersection = np.logical_and(m1, m2).sum()
-    area1 = m1.sum()
-    area2 = m2.sum()
+    print("\n--- Part 2: Segmenting object with SAM (pos + optional negatives) ---")
+    predictor.set_image(rgb_image)
 
-    if area1 == 0 or area2 == 0:
-        return 0.0
-
-    smaller_area = min(area1, area2)
-    
-    # If the smaller mask has zero area, containment is ill-defined.
-    if smaller_area == 0:
-        return 1.0 if intersection > 0 else 0.0
-
-    return intersection / smaller_area
-def calculate_iou(mask1, mask2):
-    """Calculates Intersection over Union."""
-    intersection = np.logical_and(mask1, mask2).sum()
-    union = np.logical_or(mask1, mask2).sum()
-    return intersection / union if union > 0 else 0.0
-# ### THAY ĐỔI ###: Logic chọn mask đã được cập nhật
-def segment_object_with_sam(predictor, rgb_image, point_prompt, roi_w, roi_h):
-    """
-    Segments an object. If filtering removes all masks, it falls back to the original list.
-    """
-    print("\n--- Part 2: Segmenting object with SAM (Size -> Shape -> Containment) ---")
-    
-    predictor.set_image(rgb_image) 
-    input_point = point_prompt[np.newaxis, :]
-    input_label = np.array([1])
-    
-    masks, scores, logits = predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
-        multimask_output=True,
-    )
-    
-    if len(masks) == 0:
-        print("Warning: SAM did not return any masks.")
-        return np.zeros(rgb_image.shape[:2], dtype=bool), [], []
-    # --- High-Confidence Override ---
-    max_score = np.max(scores)
-    if max_score >= HIGH_CONFIDENCE_THRESHOLD:
-        print(f"\n--- High Confidence Override ---")
-        print(f"Detected a very high score of {max_score:.4f} (>= {HIGH_CONFIDENCE_THRESHOLD}). Bypassing filters.")
-        best_mask_idx = np.argmax(scores)
-        final_mask = masks[best_mask_idx]
-        print(f"Directly selecting mask {best_mask_idx} as the final choice.")
-        return final_mask.astype(bool), masks, scores
-
-    print(f"\n--- No high-confidence mask found (max score: {max_score:.4f}). Proceeding with full filtering pipeline. ---")
-    print("\n--- Checking for duplicate masks (similar area and position) ---")
-    processed_indices = set()
-    duplicate_groups = []
-    for i in range(len(masks)):
-        if i in processed_indices: continue
-        current_group = [i]
-        processed_indices.add(i)
-        for j in range(i + 1, len(masks)):
-            if j in processed_indices: continue
-            if check_mask_similarity(masks[i], masks[j]):
-                current_group.append(j)
-                processed_indices.add(j)
-        if len(current_group) > 1:
-            duplicate_groups.append(current_group)
-
-    if duplicate_groups:
-        print(f"Found {len(duplicate_groups)} group(s) of duplicate masks. Prioritizing this logic.")
-        best_duplicate_group = duplicate_groups[0]
-        print(f"Processing first duplicate group: {best_duplicate_group}")
-
-        best_mask_in_group = None
-        best_fill_ratio = -1.0
-        best_mask_idx = -1
-        for idx in best_duplicate_group:
-            mask = masks[idx]
-            fill_ratio = calculate_fill_ratio(mask)
-            print(f"  - Mask index {idx} (score: {scores[idx]:.4f}) has fill ratio: {fill_ratio:.4f}")
-            if fill_ratio > best_fill_ratio:
-                best_fill_ratio = fill_ratio
-                best_mask_in_group = mask
-                best_mask_idx = idx
-        
-        print(f"Selected mask {best_mask_idx} from duplicates based on best fill ratio ({best_fill_ratio:.4f}).")
-        return best_mask_in_group.astype(bool), masks, scores
-    # --- 1. & 2. Filter masks by Size and Shape ---
-    # 3a. Size Filter (Hard Cutoff)
-    max_allowed_area = roi_w * roi_h * MAX_MASK_AREA_RATIO
-    print(f"--- Filtering by Size (max area: {max_allowed_area:.0f}) ---")
-    size_filtered_candidates = []
-    for i, (mask, score) in enumerate(zip(masks, scores)):
-        mask_area = np.sum(mask)
-        if mask_area < max_allowed_area:
-            fill_ratio = calculate_fill_ratio(mask)
-            size_filtered_candidates.append({
-                'mask': mask, 'score': score, 'original_index': i, 'fill_ratio': fill_ratio
-            })
-        else:
-            print(f"  -> Rejecting mask {i} - Too large.")
-
-    if not size_filtered_candidates:
-        print("Warning: All masks were filtered out for being too large. No valid candidates remain.")
-        return np.zeros(rgb_image.shape[:2], dtype=bool), masks, scores
-
-    # 3b. Shape Filter
-    print(f"--- Filtering {len(size_filtered_candidates)} candidates by Shape (min fill ratio: {MIN_FILL_RATIO}) ---")
-    shape_filtered_candidates = []
-    for candidate in size_filtered_candidates:
-        if candidate['fill_ratio'] >= MIN_FILL_RATIO:
-            shape_filtered_candidates.append(candidate)
-        else:
-            print(f"  -> Rejecting mask {candidate['original_index']} - Poor shape (fill ratio: {candidate['fill_ratio']:.2f}).")
-
-    # 3c. Final Selection Logic with New Fallback
-    final_mask = None
-    final_candidate_info = None
-    
-    # Determine which list of candidates to use for the final containment check
-    if shape_filtered_candidates:
-        # Ideal Case: We have candidates that passed all filters.
-        print(f"\nFound {len(shape_filtered_candidates)} candidates passing all filters. Refining with containment logic.")
-        candidates_for_refinement = shape_filtered_candidates
-    elif size_filtered_candidates:
-        # Fallback Case: No masks passed the shape test. Use the size-appropriate list.
-        print("\n!!! WARNING: No masks passed shape filter. Falling back to containment logic on all size-appropriate masks. !!!")
-        candidates_for_refinement = size_filtered_candidates
+    pos = np.array(point_prompt, dtype=np.int32)[None, :]         # shape (1,2)
+    if neg_points is not None and len(neg_points) > 0:
+        neg = np.array(neg_points, dtype=np.int32)                # shape (K,2)
+        pts = np.vstack([pos, neg])
+        labels = np.array([1] + [0]*len(neg), dtype=np.int32)
     else:
-        # Should not be reached, but included for safety.
-        print("Error: No valid masks found after all filtering stages.")
-        return np.zeros(rgb_image.shape[:2], dtype=bool), masks, scores
+        pts = pos
+        labels = np.array([1], dtype=np.int32)
 
-    # Run the containment logic on the chosen list of candidates
-    print(f"\n--- Final Refinement (Hierarchical: Shape -> Containment) ---")
-    candidates_for_refinement.sort(key=lambda x: x['score'], reverse=True)
-    
-    best_so_far_candidate = candidates_for_refinement[0]
-    print(f"Starting with best candidate (by score): Index {best_so_far_candidate['original_index']} (Fill Ratio: {best_so_far_candidate['fill_ratio']:.4f})")
-
-    # Iterate through the rest of the candidates to challenge the current best
-    for i in range(1, len(candidates_for_refinement)):
-        challenger_candidate = candidates_for_refinement[i]
-        
-        # --- LOGIC 1: Significant Shape (Fill Ratio) Improvement ---
-        # Does the challenger have a substantially better shape?
-        if challenger_candidate['fill_ratio'] > best_so_far_candidate['fill_ratio'] + FILL_RATIO_IMPROVEMENT_THRESHOLD:
-            print(f"  - Challenger [Idx {challenger_candidate['original_index']}]'s fill ratio ({challenger_candidate['fill_ratio']:.4f}) is "
-                  f"significantly better than current best [Idx {best_so_far_candidate['original_index']}] ({best_so_far_candidate['fill_ratio']:.4f}).")
-            print(f"  --> SWITCHING best candidate.")
-            best_so_far_candidate = challenger_candidate
-            continue # Move to the next challenger with our new champion
-
-        # --- LOGIC 2: Containment (Fallback for similar shapes) ---
-        # If shapes are similar, check if the challenger is a larger, more complete version of the current best.
-        best_mask = best_so_far_candidate['mask']
-        challenger_mask = challenger_candidate['mask']
-        
-        # We only care about the case where the challenger is LARGER and contains the current best
-        if np.sum(challenger_mask) > np.sum(best_mask):
-            containment_score = calculate_containment(best_mask, challenger_mask)
-            if containment_score > 0.95:
-                print(f"  - Challenger [Idx {challenger_candidate['original_index']}] contains the current best [Idx {best_so_far_candidate['original_index']}] (Containment: {containment_score:.2f}) and is larger.")
-                print(f"  --> SWITCHING best candidate.")
-                best_so_far_candidate = challenger_candidate
-        # else:
-        #     print(f"  - Challenger [Idx {challenger_candidate['original_index']}] does not meet criteria to replace current best.")
-
-    final_candidate_info = best_so_far_candidate
-    final_mask = final_candidate_info['mask']
-    
-    print(f"\nSegmentation complete. Final selected mask original index: {final_candidate_info['original_index']}")
-    return final_mask.astype(bool), masks, scores
-
-def segment_object_with_sam_old(predictor, rgb_image, point_prompt, roi_w, roi_h):
-    """
-    Segments an object using SAM with filtering by Size, Shape, and Confidence Score.
-    """
-    print("\n--- Part 2: Segmenting object with SAM (Size -> Shape -> Score) ---")
-    
-    predictor.set_image(rgb_image) 
-    input_point = point_prompt[np.newaxis, :]
-    input_label = np.array([1])
-    
     mask = predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
+        point_coords=pts,
+        point_labels=labels,
         multimask_output=False,
     )
-    
     return mask[0][0].astype(bool)
 
 
@@ -644,55 +750,79 @@ def process_image_pair(rgb_path, depth_path, sam_predictor, output_vis_path, out
 
         # --- Part 1: Find the closest point in the ROI ---
         pixel_x, pixel_y, _, _ = find_closest_point_in_roi(
-            depth_image, ROI_X, ROI_Y, ROI_W, ROI_H, verbose=False # verbose=False để log đỡ dài
+            depth_image, ROI_X, ROI_Y, ROI_W, ROI_H, verbose=False
         )
         point_prompt = np.array([pixel_x, pixel_y])
+        sx = SAM_IN_SIZE / float(W)
+        sy = SAM_IN_SIZE / float(H)
+        rgb_for_sam = cv2.resize(rgb_image, (SAM_IN_SIZE, SAM_IN_SIZE), interpolation=cv2.INTER_LINEAR)
 
-        # --- Part 2: Segment the object using SAM 2.1 ---
-        segmentation_mask = segment_object_with_sam_old(
-            sam_predictor, rgb_image, point_prompt, ROI_W, ROI_H
+        # scale prompts to the resized image
+        pt_sam = scale_point((int(point_prompt[0]), int(point_prompt[1])), sx, sy)
+        # === NEW: pick 2 belt negatives in ROI using depth ===
+        neg_points = sample_belt_negatives(depth_image, ROI_X, ROI_Y, ROI_W, ROI_H, k=2)
+        neg_points_sam = [scale_point(p, sx, sy) for p in neg_points]
+        print(f"Negative prompts (belt): {neg_points}")
+
+        # --- Part 2: Segment the object using SAM 2.1 with negatives ---
+        # segmentation_mask = segment_object_with_sam_old(
+        #     sam_predictor, rgb_image, point_prompt, ROI_W, ROI_H, neg_points=neg_points
+        # )
+        segmentation_mask_1024 = segment_object_with_sam_old(
+            sam_predictor,
+            rgb_for_sam,
+            np.array(pt_sam),
+            ROI_W, ROI_H,
+            neg_points=neg_points_sam  # uncomment if using negatives
         )
-        # ### THAY ĐỔI ###: Vòng lặp mới để lưu tất cả các mask
-        # print(f"\n--- Saving all {len(all_masks)} generated mask visualizations ---")
-        # for i, (mask, score) in enumerate(zip(all_masks, all_scores)):
-        #     # Tạo visualization cho mask hiện tại
-        #     # rect=None vì chúng ta chỉ quan tâm đến vùng mask, chưa có bbox
-        #     vis_img = vis_img = visualize_results(rgb_image, mask, point_prompt, None, None, None, None)
-            
-        #     # Tạo tên file và đường dẫn
-        #     vis_filename = f"mask_{i}_score_{score:.4f}.jpg"
-        #     vis_save_path = os.path.join(all_masks_vis_folder, vis_filename)
-            
-        #     # Lưu ảnh
-        #     cv2.imwrite(vis_save_path, cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
-        # print(f"All mask visualizations saved to: {all_masks_vis_folder}")        
+        segmentation_mask = cv2.resize(
+            (segmentation_mask_1024.astype(np.uint8) * 255),
+            (W, H),
+            interpolation=cv2.INTER_NEAREST
+        ).astype(bool)              
         # --- Part 3: Extract the object's point cloud ---
         depth_intrinsics = {'width': W, 'height': H, 'fx': depth_fx, 'fy': depth_fy, 'cx': depth_cx, 'cy': depth_cy}
         object_pcd = extract_point_cloud_from_mask(depth_image, rgb_image, segmentation_mask, depth_intrinsics)
         o3d.io.write_point_cloud(output_ply_path, object_pcd)
         print(f"Saved segmented object point cloud to {output_ply_path}")
-        # object_mesh = create_mesh_from_pointcloud(object_pcd)
-        # if object_mesh is not None and object_mesh.has_triangles():
-        #     o3d.io.write_triangle_mesh(output_mesh_path, object_mesh)
-        #     print(f"Saved reconstructed 3D mesh to {output_mesh_path}")
-        # else:
-        #     print("Skipping mesh saving as reconstruction failed or produced an empty mesh.")
         # --- Tìm vector pháp tuyến ---
-        final_normal = find_surface_normal(depth_image, segmentation_mask, depth_intrinsics, tilt_threshold_deg=7.0)
-        # final_normal = find_normal_from_obb(object_pcd)
+        print("Cleaning point cloud with Statistical Outlier Removal...")
+        cleaned_pcd, ind = object_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        print(f"Removed {len(object_pcd.points) - len(cleaned_pcd.points)} outlier points.")
+        final_normal = find_surface_normal(depth_image, segmentation_mask, depth_intrinsics, tilt_threshold_deg=7.0, ransac_distance_threshold=0.01)
         if final_normal is None:
             print("Error: Could not determine surface normal.")
             return None, None
-
+        mask_for_centroid = segmentation_mask.copy()
+        if np.array_equal(final_normal, np.array([0,0,1])):
+                gate = depth_gate_around_seed(depth_image, point_prompt, delta_mm=35)
+                mask_gated = segmentation_mask & gate
+                mask_seed = keep_seed_component(mask_gated, point_prompt, open_ksize=3)
+                if mask_seed.sum() < 200:  # fallback if too small
+                    mask_seed = keep_seed_component(segmentation_mask, point_prompt, open_ksize=0)
+                mask_for_centroid = mask_seed
         # --- Part 4 & 5: Calculate Final 3D Pose ---
-        oriented_rect = get_oriented_bbox_2d(segmentation_mask)
-        if oriented_rect is None:
-            print("Could not determine object pose.")
-            return None, None
-
+        oriented_rect = get_oriented_bbox_2d(mask_for_centroid)
         final_depth_mm = None
         center_x_2d, center_y_2d = oriented_rect[0]
         center_x_int, center_y_int = np.intp(oriented_rect[0])
+        if oriented_rect is None:
+            print("Could not determine object pose.")
+            return None, None
+        normal_core = core_top_mask_from_seg(
+            depth_image, segmentation_mask, oriented_rect,
+            shrink=0.90, erode_px=2, delta_mm=25
+        )
+
+        if normal_core.sum() < 300:
+            normal_core = core_top_mask_from_seg(
+                depth_image, segmentation_mask, oriented_rect,
+                shrink=0.96, erode_px=0, delta_mm=30
+            )
+        final_normal = find_surface_normal(
+            depth_image, normal_core, depth_intrinsics,
+            tilt_threshold_deg=7.0, ransac_distance_threshold=0.01
+        )
 
         # --- Primary Method: Check depth at the geometric 2D center ---
         if (0 <= center_y_int < H and 0 <= center_x_int < W):
@@ -718,8 +848,8 @@ def process_image_pair(rgb_path, depth_path, sam_predictor, output_vis_path, out
         Z_depth = final_depth_mm / 1000.0
         X_depth = (center_x_2d - depth_cx) * Z_depth / depth_fx
         Y_depth = (center_y_2d - depth_cy) * Z_depth / depth_fy
-        Y_depth *= 0.95
-        X_depth *= 1.02
+        # Y_depth *= 0.92
+        # X_depth *= 1.02
         # Y_depth *= 0.8
         pose_3d_depth_frame = np.array([X_depth, Y_depth, Z_depth])
 
