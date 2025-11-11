@@ -31,7 +31,7 @@ OUTPUT_FOLDER = "Viettel/visualize_output_private" # Thư mục chứa ảnh và
 CSV_OUTPUT_PATH = os.path.join(OUTPUT_FOLDER, "Submission_3D.csv") # Đường dẫn file CSV kết quả
 
 # --- SAM Checkpoint ---
-SAM2_CHECKPOINT = "./sam2_logs/configs/train_large21.yaml/checkpoints/checkpoint.pt"
+SAM2_CHECKPOINT = "./checkpoints/checkpoint.pt"
 MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 SAM_IN_SIZE = 1024
